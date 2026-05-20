@@ -8,13 +8,14 @@ use iced::time::Instant;
 use iced::widget::{Canvas, button, column, container, row, text, text_input};
 use iced::{Element, Fill, Padding, Task, window};
 use rustc_hash::FxHashSet;
+use std::env;
 use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::mpsc::{Receiver, channel};
 use tokio::runtime::Runtime;
 
 use circular::Circular;
-use data::FileNode;
+use data::{DataSourceKind, FileNode};
 use treemap::TreemapCanvas;
 
 use crate::theme::{button_style, succeed_container_style};
@@ -42,8 +43,9 @@ pub fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    PickFile,
-    FilePicked(Option<String>),
+    AutoLoadSystemMft,
+    PickCsvFile,
+    FilePicked(DataSourceKind, Option<String>),
     Tick(Instant),
     ToggleExpand(String),
     Navigate(String),
@@ -60,6 +62,8 @@ pub enum Message {
 enum AppState {
     Idle,
     Loading {
+        source_kind: DataSourceKind,
+        source_path: String,
         root_node: FileNode,
         current_path: String,
         expanded_paths: FxHashSet<String>,
@@ -67,6 +71,8 @@ enum AppState {
         anim_tick: usize,
     },
     Loaded {
+        source_kind: DataSourceKind,
+        source_path: String,
         root_node: FileNode,
         current_path: String,
         path_history: Vec<String>,
@@ -85,17 +91,42 @@ impl Default for AppState {
 
 struct SpaceSnifferApp {
     state: AppState,
+    auto_load_started: bool,
 }
 
 impl Default for SpaceSnifferApp {
     fn default() -> Self {
         Self {
             state: AppState::Idle,
+            auto_load_started: false,
         }
     }
 }
 
 impl SpaceSnifferApp {
+    fn resolve_system_mft_path() -> Result<String, String> {
+        let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        Ok(format!("{system_drive}\\$MFT"))
+    }
+
+    fn start_loading(&mut self, source_kind: DataSourceKind, path: String) -> Task<Message> {
+        let (tx, rx) = channel::<Result<FileNode, String>>();
+
+        data::build_tree_stream(source_kind, path.clone(), tx);
+
+        self.state = AppState::Loading {
+            source_kind,
+            source_path: path,
+            root_node: FileNode::root(),
+            current_path: "".to_string(),
+            expanded_paths: FxHashSet::default(),
+            rx,
+            anim_tick: 0,
+        };
+
+        Task::none()
+    }
+
     fn find_node<'a>(root: &'a FileNode, path: &str) -> Option<&'a FileNode> {
         if path.is_empty() {
             return Some(root);
@@ -113,17 +144,22 @@ impl SpaceSnifferApp {
     }
 
     fn subscription(&self) -> iced::Subscription<Message> {
-        match &self.state {
-            AppState::Loading { .. } | AppState::Loaded { .. } => {
-                window::frames().map(Message::Tick)
-            }
-            _ => iced::Subscription::none(),
-        }
+        window::frames().map(Message::Tick)
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::PickFile => Task::perform(
+            Message::AutoLoadSystemMft => {
+                self.auto_load_started = true;
+                match Self::resolve_system_mft_path() {
+                    Ok(path) => self.start_loading(DataSourceKind::Mft, path),
+                    Err(err) => {
+                        self.state = AppState::Error(err);
+                        Task::none()
+                    }
+                }
+            }
+            Message::PickCsvFile => Task::perform(
                 async {
                     rfd::AsyncFileDialog::new()
                         .add_filter("CSV Data", &["csv"])
@@ -131,24 +167,15 @@ impl SpaceSnifferApp {
                         .await
                         .map(|f| f.path().to_string_lossy().to_string())
                 },
-                Message::FilePicked,
+                |path| Message::FilePicked(DataSourceKind::Csv, path),
             ),
-            Message::FilePicked(Some(path)) => {
-                let (tx, rx) = channel::<Result<FileNode, String>>();
-
-                data::build_tree_stream(path, tx);
-
-                self.state = AppState::Loading {
-                    root_node: FileNode::new("Computer".into(), "".into(), true),
-                    current_path: "".to_string(),
-                    expanded_paths: FxHashSet::default(),
-                    rx,
-                    anim_tick: 0,
-                };
-                Task::none()
-            }
-            Message::FilePicked(None) => Task::none(),
+            Message::FilePicked(source_kind, Some(path)) => self.start_loading(source_kind, path),
+            Message::FilePicked(_, None) => Task::none(),
             Message::Tick(_now) => {
+                if matches!(self.state, AppState::Idle) && !self.auto_load_started {
+                    return Task::done(Message::AutoLoadSystemMft);
+                }
+
                 let mut is_finished_loading = false;
                 let mut error_msg = None;
 
@@ -194,12 +221,16 @@ impl SpaceSnifferApp {
                     std::mem::swap(&mut self.state, &mut temp_state);
 
                     if let AppState::Loading {
+                        source_kind,
+                        source_path,
                         root_node,
                         expanded_paths,
                         ..
                     } = temp_state
                     {
                         self.state = AppState::Loaded {
+                            source_kind,
+                            source_path,
                             root_node,
                             current_path: "".to_string(),
                             path_history: Vec::new(),
@@ -343,15 +374,19 @@ impl SpaceSnifferApp {
     fn view(&self) -> Element<'_, Message> {
         match &self.state {
             AppState::Idle => container(
-                button(text("选择 Everything 导出的 CSV 文件"))
-                    .style(button_style)
-                    .padding(Padding{
-                        top: 8.0,
-                        right: 12.0,
-                        bottom: 8.0,
-                        left: 12.0,
-                    })
-                    .on_press(Message::PickFile),
+                column![
+                    text("正在自动定位系统盘 MFT...").size(20),
+                    button(text("改为选择 Everything 导出的 CSV"))
+                        .style(button_style)
+                        .padding(Padding {
+                            top: 8.0,
+                            right: 12.0,
+                            bottom: 8.0,
+                            left: 12.0,
+                        })
+                        .on_press(Message::PickCsvFile)
+                ]
+                .spacing(16),
             )
             .width(Fill)
             .height(Fill)
@@ -359,6 +394,8 @@ impl SpaceSnifferApp {
             .into(),
 
             AppState::Loading {
+                source_kind,
+                source_path,
                 root_node,
                 current_path,
                 expanded_paths,
@@ -369,8 +406,10 @@ impl SpaceSnifferApp {
                 let top_bar = row![
                     Circular::new().size(20.0).easing(&easing::STANDARD),
                     text(format!(
-                        "少女祈祷中... 已索引: {}",
-                        treemap::format_size(root_node.size)
+                        "少女祈祷中... 来源: {} | 已索引: {} | {}",
+                        source_kind.label(),
+                        treemap::format_size(root_node.size),
+                        source_path
                     ))
                     .size(18)
                 ]
@@ -391,13 +430,29 @@ impl SpaceSnifferApp {
                 .into()
             }
 
-            AppState::Error(err) => container(text(format!("ERR: {}", err)).style(text::danger))
-                .width(Fill)
-                .height(Fill)
-                .center(Fill)
-                .into(),
+            AppState::Error(err) => container(
+                column![
+                    text(format!("ERR: {}", err)).style(text::danger),
+                    row![
+                        button("重试自动加载系统盘 MFT")
+                            .style(button_style)
+                            .on_press(Message::AutoLoadSystemMft),
+                        button("选择 Everything 导出的 CSV")
+                            .style(button_style)
+                            .on_press(Message::PickCsvFile),
+                    ]
+                    .spacing(12)
+                ]
+                .spacing(16),
+            )
+            .width(Fill)
+            .height(Fill)
+            .center(Fill)
+            .into(),
 
             AppState::Loaded {
+                source_kind,
+                source_path,
                 root_node,
                 current_path,
                 path_history,
@@ -419,14 +474,15 @@ impl SpaceSnifferApp {
                 };
                 top_bar = top_bar.push(
                     text(format!(
-                        "当前位置: {} ({})",
+                        "当前位置: {} ({}) | 来源: {} | {}",
                         display_path,
-                        treemap::format_size(current_node.size)
+                        treemap::format_size(current_node.size),
+                        source_kind.label(),
+                        source_path
                     ))
                     .size(18),
                 );
 
-                // 如果正在重命名，显示悬浮输入框组
                 if let Some((_, input_name)) = rename_target {
                     top_bar = top_bar
                         .push(text("正在重命名:"))

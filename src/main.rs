@@ -5,7 +5,7 @@ mod treemap;
 mod theme;
 
 use iced::time::Instant;
-use iced::widget::{Canvas, Space, button, column, container, row, text, text_input};
+use iced::widget::{Canvas, Space, button, checkbox, column, container, row, text, text_input};
 use iced::{Element, Fill, Padding, Task, window};
 use rustc_hash::FxHashSet;
 use std::env;
@@ -57,6 +57,10 @@ pub fn main() -> iced::Result {
 #[derive(Debug, Clone)]
 pub enum Message {
     LoadEverything,
+    ToggleEverythingDrive(String, bool),
+    SelectAllEverythingDrives,
+    ClearEverythingDrives,
+    ConfirmEverythingDrives,
     LoadMft,
     PickCsvFile,
     FilePicked(DataSourceKind, Option<String>),
@@ -78,6 +82,9 @@ pub enum Message {
 
 enum AppState {
     Idle,
+    PickingEverythingDrives {
+        drives: Vec<DriveSelection>,
+    },
     Loading {
         source_kind: DataSourceKind,
         source_path: String,
@@ -104,6 +111,12 @@ enum AppState {
     Error(String),
 }
 
+#[derive(Debug, Clone)]
+struct DriveSelection {
+    drive: String,
+    selected: bool,
+}
+
 impl Default for AppState {
     fn default() -> Self {
         AppState::Idle
@@ -126,6 +139,44 @@ impl Default for SpaceSnifferApp {
 }
 
 impl SpaceSnifferApp {
+    fn enumerate_drives() -> Vec<DriveSelection> {
+        let mut drives = Vec::new();
+
+        for letter in 'A'..='Z' {
+            let drive = format!("{letter}:");
+            let root = format!("{drive}\\");
+            if Path::new(&root).exists() {
+                drives.push(DriveSelection {
+                    drive,
+                    selected: true,
+                });
+            }
+        }
+
+        if drives.is_empty() {
+            drives.push(DriveSelection {
+                drive: env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string()),
+                selected: true,
+            });
+        }
+
+        drives
+    }
+
+    fn build_everything_query(drives: &[DriveSelection]) -> Result<String, String> {
+        let selected: Vec<&str> = drives
+            .iter()
+            .filter(|drive| drive.selected)
+            .map(|drive| drive.drive.as_str())
+            .collect();
+
+        if selected.is_empty() {
+            return Err("至少选择一个盘符才能使用 Everything 扫描。".to_string());
+        }
+
+        Ok(selected.join("|"))
+    }
+
     fn resolve_system_mft_path() -> Result<String, String> {
         let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
         Ok(format!("{system_drive}\\$MFT"))
@@ -173,9 +224,51 @@ impl SpaceSnifferApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::LoadEverything => {
-                log::info!("[app] loading everything dll source");
-                let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-                self.start_loading(DataSourceKind::EverythingDll, system_drive)
+                log::info!("[app] opening everything drive picker");
+                self.state = AppState::PickingEverythingDrives {
+                    drives: Self::enumerate_drives(),
+                };
+                Task::none()
+            }
+            Message::ToggleEverythingDrive(target, selected) => {
+                if let AppState::PickingEverythingDrives { drives } = &mut self.state {
+                    if let Some(drive) = drives.iter_mut().find(|drive| drive.drive == target) {
+                        drive.selected = selected;
+                    }
+                }
+                Task::none()
+            }
+            Message::SelectAllEverythingDrives => {
+                if let AppState::PickingEverythingDrives { drives } = &mut self.state {
+                    for drive in drives {
+                        drive.selected = true;
+                    }
+                }
+                Task::none()
+            }
+            Message::ClearEverythingDrives => {
+                if let AppState::PickingEverythingDrives { drives } = &mut self.state {
+                    for drive in drives {
+                        drive.selected = false;
+                    }
+                }
+                Task::none()
+            }
+            Message::ConfirmEverythingDrives => {
+                if let AppState::PickingEverythingDrives { drives } = &self.state {
+                    match Self::build_everything_query(drives) {
+                        Ok(query) => {
+                            log::info!("[app] loading everything dll source with query {}", query);
+                            return self.start_loading(DataSourceKind::EverythingDll, query);
+                        }
+                        Err(err) => {
+                            log::error!("[app] invalid everything drive selection: {}", err);
+                            self.state = AppState::Error(err);
+                            return Task::none();
+                        }
+                    }
+                }
+                Task::none()
             }
             Message::LoadMft => {
                 log::info!("[app] loading mft source");
@@ -539,6 +632,73 @@ impl SpaceSnifferApp {
                     column![title_section, cards]
                         .spacing(48)
                         .align_x(iced::Alignment::Center)
+                )
+                .style(idle_container_style)
+                .width(Fill)
+                .height(Fill)
+                .center(Fill)
+                .into()
+            }
+
+            AppState::PickingEverythingDrives { drives } => {
+                let selected_count = drives.iter().filter(|drive| drive.selected).count();
+
+                let drive_list = drives.iter().fold(
+                    column![].spacing(10),
+                    |column, drive| {
+                        column.push(
+                            checkbox(drive.selected)
+                                .label(drive.drive.clone())
+                                .text_size(18)
+                                .on_toggle({
+                                    let drive_name = drive.drive.clone();
+                                    move |selected| {
+                                        Message::ToggleEverythingDrive(drive_name.clone(), selected)
+                                    }
+                                })
+                        )
+                    },
+                );
+
+                let confirm_button = if selected_count > 0 {
+                    button("开始扫描所选盘符")
+                        .style(recommend_button_style)
+                        .padding(14)
+                        .on_press(Message::ConfirmEverythingDrives)
+                } else {
+                    button("开始扫描所选盘符")
+                        .style(secondary_button_style)
+                        .padding(14)
+                };
+
+                container(
+                    column![
+                        text("要扫描哪些盘？")
+                            .size(34),
+                        text("它与内存皆遗憾。")
+                            .size(15)
+                            .style(text::secondary),
+                        drive_list,
+                        row![
+                            button("返回")
+                                .style(button_style)
+                                .padding(10)
+                                .on_press(Message::BackToIdle),
+                            button("全选")
+                                .style(secondary_button_style)
+                                .padding(10)
+                                .on_press(Message::SelectAllEverythingDrives),
+                            button("清空")
+                                .style(secondary_button_style)
+                                .padding(10)
+                                .on_press(Message::ClearEverythingDrives),
+                            confirm_button,
+                        ]
+                        .spacing(12)
+                        .align_y(iced::Alignment::Center)
+                    ]
+                    .spacing(24)
+                    .align_x(iced::Alignment::Start)
                 )
                 .style(idle_container_style)
                 .width(Fill)

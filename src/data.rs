@@ -902,7 +902,39 @@ unsafe extern "system" {
 
 
 #[cfg(windows)]
+const EVERYTHING64_DLL_BYTES: &[u8] = include_bytes!("../sdk/dll/Everything64.dll");
+
+#[cfg(windows)]
 impl EverythingLib {
+    fn extract_embedded_dll() -> Result<std::path::PathBuf, String> {
+        // 1. 优先尝试释放到程序 exe 同级目录
+        let exe_dir = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()));
+
+        if let Some(mut path) = exe_dir {
+            path.push("Everything64.dll");
+            if !path.exists() {
+                if std::fs::write(&path, EVERYTHING64_DLL_BYTES).is_ok() {
+                    return Ok(path);
+                }
+            } else {
+                return Ok(path);
+            }
+        }
+
+        // 2. 如果 exe 目录获取/写入失败， fallback 写入当前工作目录
+        let mut work_path = std::env::current_dir()
+            .map_err(|e| format!("获取当前工作目录失败: {}", e))?;
+        work_path.push("Everything64.dll");
+
+        if !work_path.exists() {
+            std::fs::write(&work_path, EVERYTHING64_DLL_BYTES)
+                .map_err(|e| format!("释放 Everything64.dll 到工作目录失败: {}", e))?;
+        }
+        Ok(work_path)
+    }
+
     pub fn load() -> Result<Self, String> {
         use std::ffi::OsStr;
         use std::os::windows::ffi::OsStrExt;
@@ -934,8 +966,19 @@ impl EverythingLib {
             }
         }
 
+        // 自行释放并读取！
         if hmodule.is_null() {
-            return Err("未找到 Everything64.dll。请确保 sdk/dll/Everything64.dll 存在，或者将其放置在程序运行目录下。".to_string());
+            if let Ok(extracted_path) = Self::extract_embedded_dll() {
+                let wide: Vec<u16> = OsStr::new(&extracted_path).encode_wide().chain(std::iter::once(0)).collect();
+                let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+                if !handle.is_null() {
+                    hmodule = handle;
+                }
+            }
+        }
+
+        if hmodule.is_null() {
+            return Err("未找到 Everything64.dll 且释放嵌入 DLL 失败。请确保程序对运行目录或工作目录具有写入权限。".to_string());
         }
 
         unsafe {

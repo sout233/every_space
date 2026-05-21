@@ -18,8 +18,9 @@ use circular::Circular;
 use data::{DataSourceKind, FileNode};
 use treemap::TreemapCanvas;
 
-use crate::theme::{button_style, succeed_container_style};
+use crate::theme::{button_style, succeed_container_style, idle_container_style, recommend_button_style, secondary_button_style};
 
+#[allow(dead_code)]
 fn get_tokio_runtime() -> &'static Runtime {
     static RUNTIME: OnceLock<Runtime> = OnceLock::new();
     RUNTIME.get_or_init(|| {
@@ -43,7 +44,8 @@ pub fn main() -> iced::Result {
 
 #[derive(Debug, Clone)]
 pub enum Message {
-    AutoLoadSystemMft,
+    LoadEverything,
+    LoadMft,
     PickCsvFile,
     FilePicked(DataSourceKind, Option<String>),
     Tick(Instant),
@@ -57,6 +59,7 @@ pub enum Message {
     RenameInputChanged(String),
     ConfirmRename,
     CancelRename,
+    BackToIdle,
 }
 
 enum AppState {
@@ -78,7 +81,7 @@ enum AppState {
         path_history: Vec<String>,
         expanded_paths: FxHashSet<String>,
         anim_tick: usize,
-        rename_target: Option<(String, String)>, // 原路径
+        rename_target: Option<(String, String)>, // (原路径, 新名字输入)
     },
     Error(String),
 }
@@ -91,6 +94,7 @@ impl Default for AppState {
 
 struct SpaceSnifferApp {
     state: AppState,
+    #[allow(dead_code)]
     auto_load_started: bool,
 }
 
@@ -149,8 +153,11 @@ impl SpaceSnifferApp {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AutoLoadSystemMft => {
-                self.auto_load_started = true;
+            Message::LoadEverything => {
+                let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+                self.start_loading(DataSourceKind::EverythingDll, system_drive)
+            }
+            Message::LoadMft => {
                 match Self::resolve_system_mft_path() {
                     Ok(path) => self.start_loading(DataSourceKind::Mft, path),
                     Err(err) => {
@@ -172,10 +179,6 @@ impl SpaceSnifferApp {
             Message::FilePicked(source_kind, Some(path)) => self.start_loading(source_kind, path),
             Message::FilePicked(_, None) => Task::none(),
             Message::Tick(_now) => {
-                if matches!(self.state, AppState::Idle) && !self.auto_load_started {
-                    return Task::done(Message::AutoLoadSystemMft);
-                }
-
                 let mut is_finished_loading = false;
                 let mut error_msg = None;
 
@@ -183,7 +186,6 @@ impl SpaceSnifferApp {
                     root_node,
                     rx,
                     anim_tick,
-                    expanded_paths: _,
                     ..
                 } = &mut self.state
                 {
@@ -243,11 +245,11 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::ToggleExpand(path) => {
-                if let AppState::Loaded { expanded_paths, .. }
-                | AppState::Loading { expanded_paths, .. } = &mut self.state
-                {
-                    if !expanded_paths.insert(path.clone()) {
+                if let AppState::Loaded { expanded_paths, .. } = &mut self.state {
+                    if expanded_paths.contains(&path) {
                         expanded_paths.remove(&path);
+                    } else {
+                        expanded_paths.insert(path);
                     }
                 }
                 Task::none()
@@ -257,7 +259,6 @@ impl SpaceSnifferApp {
                     root_node,
                     current_path,
                     path_history,
-                    expanded_paths,
                     ..
                 } = &mut self.state
                 {
@@ -265,7 +266,6 @@ impl SpaceSnifferApp {
                         if node.is_dir {
                             path_history.push(current_path.clone());
                             *current_path = path;
-                            expanded_paths.clear();
                         }
                     }
                 }
@@ -275,37 +275,30 @@ impl SpaceSnifferApp {
                 if let AppState::Loaded {
                     current_path,
                     path_history,
-                    expanded_paths,
                     ..
                 } = &mut self.state
                 {
                     if let Some(prev) = path_history.pop() {
                         *current_path = prev;
-                        expanded_paths.clear();
                     }
                 }
                 Task::none()
             }
             Message::OpenInExplorer(path) => {
-                std::process::Command::new("explorer")
+                let _ = std::process::Command::new("explorer")
                     .arg("/select,")
                     .arg(&path)
-                    .spawn()
-                    .ok();
+                    .spawn();
                 Task::none()
             }
             Message::RequestDelete(path) => {
                 let path_clone = path.clone();
                 Task::perform(
                     async move {
-                        let success = get_tokio_runtime()
-                            .spawn_blocking(move || trash::delete(&path_clone).is_ok())
-                            .await
-                            .unwrap_or(false);
-
-                        (path, success)
+                        let p = std::path::Path::new(&path_clone);
+                        trash::delete(p).is_ok()
                     },
-                    |(p, s)| Message::FileDeleted(p, s),
+                    move |success| Message::FileDeleted(path, success)
                 )
             }
             Message::FileDeleted(path, success) => {
@@ -315,6 +308,27 @@ impl SpaceSnifferApp {
                     }
                 } else {
                     println!("放入回收站失败");
+                }
+                Task::none()
+            }
+            Message::RequestRename(path) => {
+                if let AppState::Loaded { rename_target, .. } = &mut self.state {
+                    let old_name = Path::new(&path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string();
+                    *rename_target = Some((path, old_name));
+                }
+                Task::none()
+            }
+            Message::RenameInputChanged(val) => {
+                if let AppState::Loaded {
+                    rename_target: Some((_, input)),
+                    ..
+                } = &mut self.state
+                {
+                    *input = val;
                 }
                 Task::none()
             }
@@ -340,32 +354,14 @@ impl SpaceSnifferApp {
                 }
                 Task::none()
             }
-            Message::RenameInputChanged(val) => {
-                if let AppState::Loaded {
-                    rename_target: Some((_, input)),
-                    ..
-                } = &mut self.state
-                {
-                    *input = val;
-                }
-                Task::none()
-            }
-
             Message::CancelRename => {
                 if let AppState::Loaded { rename_target, .. } = &mut self.state {
                     *rename_target = None;
                 }
                 Task::none()
             }
-            Message::RequestRename(path) => {
-                if let AppState::Loaded { rename_target, .. } = &mut self.state {
-                    let old_name = Path::new(&path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string();
-                    *rename_target = Some((path, old_name));
-                }
+            Message::BackToIdle => {
+                self.state = AppState::Idle;
                 Task::none()
             }
         }
@@ -373,25 +369,92 @@ impl SpaceSnifferApp {
 
     fn view(&self) -> Element<'_, Message> {
         match &self.state {
-            AppState::Idle => container(
-                column![
-                    text("正在自动定位系统盘 MFT...").size(20),
-                    button(text("改为选择 Everything 导出的 CSV"))
-                        .style(button_style)
-                        .padding(Padding {
-                            top: 8.0,
-                            right: 12.0,
-                            bottom: 8.0,
-                            left: 12.0,
-                        })
-                        .on_press(Message::PickCsvFile)
+            AppState::Idle => {
+                let title_section = column![
+                    text("EverySpace")
+                        .size(48),
+                    text("硬盘被橄榄了……")
+                        .size(18)
+                        .style(text::secondary),
                 ]
-                .spacing(16),
-            )
-            .width(Fill)
-            .height(Fill)
-            .center(Fill)
-            .into(),
+                .spacing(12)
+                .align_x(iced::Alignment::Center);
+
+                let cards = row![
+                    // 卡片 1
+                    button(
+                        column![
+                            text("直接调用 Everything")
+                                .size(20),
+                            text("推荐")
+                                .size(13),
+                            text("这个好，用这个")
+                                .size(12),
+                            text("（要求 Everything 正在后台运行）")
+                                .size(11),
+                        ]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center)
+                    )
+                    .style(recommend_button_style)
+                    .padding(24)
+                    .on_press(Message::LoadEverything)
+                    .width(235),
+
+                    // 卡片 2
+                    button(
+                        column![
+                            text("读取 Everything CSV 报告")
+                                .size(20),
+                            text("离线分析")
+                                .size(13),
+                            text("读取手动导出的 CSV，无法热更新内容")
+                                .size(12),
+                            text("（明明我才是先来的……）")
+                                .size(11),
+                        ]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center)
+                    )
+                    .style(secondary_button_style)
+                    .padding(24)
+                    .on_press(Message::PickCsvFile)
+                    .width(275),
+
+                    // 卡片 3
+                    button(
+                        column![
+                            text("直接读取 NTFS MFT")
+                                .size(20),
+                            text("我操。NTFS。")
+                                .size(13),
+                            text("不太稳，不太准")
+                                .size(12),
+                            text("（需要右键以管理员权限运行）")
+                                .size(11),
+                        ]
+                        .spacing(8)
+                        .align_x(iced::Alignment::Center)
+                    )
+                    .style(secondary_button_style)
+                    .padding(24)
+                    .on_press(Message::LoadMft)
+                    .width(230),
+                ]
+                .spacing(24)
+                .align_y(iced::Alignment::Center);
+
+                container(
+                    column![title_section, cards]
+                        .spacing(48)
+                        .align_x(iced::Alignment::Center)
+                )
+                .style(idle_container_style)
+                .width(Fill)
+                .height(Fill)
+                .center(Fill)
+                .into()
+            }
 
             AppState::Loading {
                 source_kind,
@@ -406,7 +469,7 @@ impl SpaceSnifferApp {
                 let top_bar = row![
                     Circular::new().size(20.0).easing(&easing::STANDARD),
                     text(format!(
-                        "少女祈祷中... 来源: {} | 已索引: {} | {}",
+                        "少女祈祷中... 来源: {} | 已分析大小: {} | {}",
                         source_kind.label(),
                         treemap::format_size(root_node.size),
                         source_path
@@ -425,6 +488,7 @@ impl SpaceSnifferApp {
                     container(top_bar).padding(10),
                     Canvas::new(map).width(Fill).height(Fill)
                 ])
+                .style(succeed_container_style)
                 .width(Fill)
                 .height(Fill)
                 .into()
@@ -432,19 +496,25 @@ impl SpaceSnifferApp {
 
             AppState::Error(err) => container(
                 column![
-                    text(format!("ERR: {}", err)).style(text::danger),
-                    row![
-                        button("重试自动加载系统盘 MFT")
-                            .style(button_style)
-                            .on_press(Message::AutoLoadSystemMft),
-                        button("选择 Everything 导出的 CSV")
-                            .style(button_style)
-                            .on_press(Message::PickCsvFile),
-                    ]
-                    .spacing(12)
+                    text("出错了")
+                        .size(36),
+                    text(format!("错误信息: {}", err))
+                        .size(16)
+                        .style(text::danger),
+                    button("返回主选择界面")
+                        .style(button_style)
+                        .padding(Padding {
+                            top: 8.0,
+                            right: 12.0,
+                            bottom: 8.0,
+                            left: 12.0,
+                        })
+                        .on_press(Message::BackToIdle)
                 ]
-                .spacing(16),
+                .spacing(24)
+                .align_x(iced::Alignment::Center),
             )
+            .style(idle_container_style)
             .width(Fill)
             .height(Fill)
             .center(Fill)
@@ -462,10 +532,32 @@ impl SpaceSnifferApp {
             } => {
                 let current_node = Self::find_node(root_node, current_path).unwrap_or(root_node);
 
-                let mut top_bar = row![].spacing(10).align_y(iced::Alignment::Center);
+                let mut top_bar = row![].spacing(12).align_y(iced::Alignment::Center);
                 if !path_history.is_empty() {
-                    top_bar = top_bar.push(button("折返").style(button_style).on_press(Message::GoBack));
+                    top_bar = top_bar.push(
+                        button("返回上级")
+                            .style(button_style)
+                            .padding(Padding {
+                                top: 6.0,
+                                right: 12.0,
+                                bottom: 6.0,
+                                left: 12.0,
+                            })
+                            .on_press(Message::GoBack)
+                    );
                 }
+
+                top_bar = top_bar.push(
+                    button("重新选择数据源")
+                        .style(button_style)
+                        .padding(Padding {
+                            top: 6.0,
+                            right: 12.0,
+                            bottom: 6.0,
+                            left: 12.0,
+                        })
+                        .on_press(Message::BackToIdle)
+                );
 
                 let display_path = if current_path.is_empty() {
                     "计算机 (根目录)"
@@ -480,26 +572,38 @@ impl SpaceSnifferApp {
                         source_kind.label(),
                         source_path
                     ))
-                    .size(18),
+                    .size(16),
                 );
 
                 if let Some((_, input_name)) = rename_target {
                     top_bar = top_bar
-                        .push(text("正在重命名:"))
+                        .push(text("重命名为:").size(14))
                         .push(
-                            text_input("输入新文件名...", input_name)
+                            text_input("输入新名称...", input_name)
                                 .on_input(Message::RenameInputChanged)
                                 .width(200.0)
                                 .on_submit(Message::ConfirmRename),
                         )
                         .push(
-                            button("OK")
+                            button("确定")
                                 .style(button::success)
+                                .padding(Padding {
+                                    top: 4.0,
+                                    right: 10.0,
+                                    bottom: 4.0,
+                                    left: 10.0,
+                                })
                                 .on_press(Message::ConfirmRename),
                         )
                         .push(
-                            button("Cancel")
+                            button("取消")
                                 .style(button::danger)
+                                .padding(Padding {
+                                    top: 4.0,
+                                    right: 10.0,
+                                    bottom: 4.0,
+                                    left: 10.0,
+                                })
                                 .on_press(Message::CancelRename),
                         );
                 }

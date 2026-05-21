@@ -10,6 +10,7 @@ const STREAM_CHUNK_SIZE: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataSourceKind {
+    EverythingDll,
     Csv,
     Mft,
 }
@@ -17,6 +18,7 @@ pub enum DataSourceKind {
 impl DataSourceKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::EverythingDll => "Everything IPC",
             Self::Csv => "Everything CSV",
             Self::Mft => "NTFS MFT",
         }
@@ -219,6 +221,7 @@ pub fn build_tree_stream(
 ) {
     std::thread::spawn(move || {
         let result = match source_kind {
+            DataSourceKind::EverythingDll => build_tree_from_everything_dll(&file_path, &tx),
             DataSourceKind::Csv => build_tree_from_csv(&file_path, &tx),
             DataSourceKind::Mft => build_tree_from_mft(&file_path, &tx),
         };
@@ -646,7 +649,7 @@ fn build_tree_from_volume_mft(
                         if let Some(attr) = name_attr {
                             let name = attr.name.clone();
                             let parent_id = attr.parent.entry;
-                            
+
                             // 从 $DATA (0x80) 属性中获取文件的真实/最新大小，防止大小缩水
                             let mut size = 0u64;
                             if !is_dir {
@@ -693,12 +696,10 @@ fn build_tree_from_volume_mft(
                     break;
                 }
                 Err(_) => {
-                    // 读取失败（可能由于 total_records 估算过大导致越界）。
-                    // 我们不采取耗时极长的单步 probe -= 1，而是使用二分查找在 O(log N) 步内瞬间定位到最大有效的 MFT record。
                     let mut low = 0;
                     let mut high = probe - 1;
                     let mut found_valid = None;
-                    
+
                     while low <= high {
                         let mid = low + (high - low) / 2;
                         let test_res = unsafe { read_record(handle, mid, record_size) };
@@ -715,7 +716,7 @@ fn build_tree_from_volume_mft(
                             }
                         }
                     }
-                    
+
                     if let Some(valid_record) = found_valid {
                         probe = valid_record as i64;
                     } else {
@@ -728,7 +729,6 @@ fn build_tree_from_volume_mft(
         let drive_letter = file_path.chars().next().unwrap_or('C');
         let drive_prefix = format!("{}:", drive_letter);
 
-        // 1. 建立节点邻接表以支持 O(N) 的 DFS 高性能树构建
         let mut parent_to_children: rustc_hash::FxHashMap<u64, Vec<u64>> = rustc_hash::FxHashMap::default();
         for (&id, entry) in &cache {
             if id != 5 {
@@ -736,7 +736,6 @@ fn build_tree_from_volume_mft(
             }
         }
 
-        // 2. 递归 DFS 构建节点树，每一项仅访问一次，杜绝字符串路径分割和哈希重复查找
         fn build_node_recursive(
             id: u64,
             current_path: String,
@@ -785,7 +784,6 @@ fn build_tree_from_volume_mft(
                 &mut visited,
             );
 
-            // 3. 收集在用但由于父目录缺失而无法回溯到 5 的有效孤立文件，统一挂载在 [Lost Files] 下
             let mut lost_files = Vec::new();
             for (&id, entry) in &cache {
                 if !visited.contains(&id) && !entry.is_dir && entry.size > 0 {
@@ -880,4 +878,194 @@ fn normalize_mft_path(path: &Path) -> String {
         }
     }
     parts.join("\\")
+}
+
+#[cfg(windows)]
+pub struct EverythingLib {
+    hmodule: windows_sys::Win32::Foundation::HMODULE,
+    pub set_search: unsafe extern "system" fn(*const u16),
+    pub set_request_flags: unsafe extern "system" fn(u32),
+    pub query: unsafe extern "system" fn(i32) -> i32,
+    pub get_num_results: unsafe extern "system" fn() -> u32,
+    pub is_folder_result: unsafe extern "system" fn(u32) -> i32,
+    pub get_result_file_name: unsafe extern "system" fn(u32) -> *const u16,
+    pub get_result_path: unsafe extern "system" fn(u32) -> *const u16,
+    pub get_result_size: unsafe extern "system" fn(u32, *mut u64) -> i32,
+    pub reset: unsafe extern "system" fn(),
+    pub get_last_error: unsafe extern "system" fn() -> u32,
+}
+
+#[cfg(windows)]
+unsafe extern "system" {
+    fn FreeLibrary(hLibModule: windows_sys::Win32::Foundation::HMODULE) -> i32;
+}
+
+
+#[cfg(windows)]
+impl EverythingLib {
+    pub fn load() -> Result<Self, String> {
+        use std::ffi::OsStr;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, GetProcAddress};
+
+        let paths = [
+            std::path::Path::new("Everything64.dll").to_path_buf(),
+            std::path::Path::new("sdk/dll/Everything64.dll").to_path_buf(),
+            std::path::Path::new("sdk\\dll\\Everything64.dll").to_path_buf(),
+        ];
+
+        let mut hmodule = std::ptr::null_mut();
+        for path in &paths {
+            if path.exists() {
+                let wide: Vec<u16> = OsStr::new(path).encode_wide().chain(std::iter::once(0)).collect();
+                let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+                if !handle.is_null() {
+                    hmodule = handle;
+                    break;
+                }
+            }
+        }
+
+        if hmodule.is_null() {
+            let wide: Vec<u16> = OsStr::new("Everything64.dll").encode_wide().chain(std::iter::once(0)).collect();
+            let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
+            if !handle.is_null() {
+                hmodule = handle;
+            }
+        }
+
+        if hmodule.is_null() {
+            return Err("未找到 Everything64.dll。请确保 sdk/dll/Everything64.dll 存在，或者将其放置在程序运行目录下。".to_string());
+        }
+
+        unsafe {
+            let get_fn = |name: &str| -> Result<*const std::ffi::c_void, String> {
+                let name_c = std::ffi::CString::new(name).unwrap();
+                let addr = GetProcAddress(hmodule, name_c.as_ptr() as *const u8);
+                if addr.is_none() {
+                    FreeLibrary(hmodule);
+                    return Err(format!("在 DLL 中未找到函数: {}", name));
+                }
+                Ok(addr.unwrap() as *const std::ffi::c_void)
+            };
+
+            Ok(Self {
+                hmodule,
+                set_search: std::mem::transmute(get_fn("Everything_SetSearchW")?),
+                set_request_flags: std::mem::transmute(get_fn("Everything_SetRequestFlags")?),
+                query: std::mem::transmute(get_fn("Everything_QueryW")?),
+                get_num_results: std::mem::transmute(get_fn("Everything_GetNumResults")?),
+                is_folder_result: std::mem::transmute(get_fn("Everything_IsFolderResult")?),
+                get_result_file_name: std::mem::transmute(get_fn("Everything_GetResultFileNameW")?),
+                get_result_path: std::mem::transmute(get_fn("Everything_GetResultPathW")?),
+                get_result_size: std::mem::transmute(get_fn("Everything_GetResultSize")?),
+                reset: std::mem::transmute(get_fn("Everything_Reset")?),
+                get_last_error: std::mem::transmute(get_fn("Everything_GetLastError")?),
+            })
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for EverythingLib {
+    fn drop(&mut self) {
+        if !self.hmodule.is_null() {
+            unsafe {
+                FreeLibrary(self.hmodule);
+            }
+        }
+    }
+}
+
+
+#[cfg(windows)]
+unsafe fn u16_ptr_to_string(ptr: *const u16) -> String {
+    if ptr.is_null() {
+        return String::new();
+    }
+    let mut len = 0;
+    unsafe {
+        while *ptr.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(ptr, len);
+        String::from_utf16_lossy(slice)
+    }
+}
+
+
+#[cfg(windows)]
+fn build_tree_from_everything_dll(
+    search_str: &str,
+    tx: &Sender<Result<FileNode, String>>,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let lib = EverythingLib::load()?;
+    let search_wide: Vec<u16> = std::ffi::OsStr::new(search_str)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    unsafe {
+        (lib.set_search)(search_wide.as_ptr());
+        // 请求：名称 (0x1) | 路径 (0x2) | 大小 (0x10)
+        (lib.set_request_flags)(0x00000001 | 0x00000002 | 0x00000010);
+
+        let ok = (lib.query)(1);
+        if ok == 0 {
+            let err_code = (lib.get_last_error)();
+            if err_code == 2 {
+                return Err("无法连接到 Everything 服务。请确保 Everything 客户端已启动且正在后台运行。".to_string());
+            } else {
+                return Err(format!("Everything 查询失败，错误码: {}", err_code));
+            }
+        }
+
+        let num_results = (lib.get_num_results)();
+        let mut acc = TreeAccumulator::new();
+
+        for i in 0..num_results {
+            let is_dir = (lib.is_folder_result)(i) != 0;
+
+            let name_ptr = (lib.get_result_file_name)(i);
+            let path_ptr = (lib.get_result_path)(i);
+
+            let name = u16_ptr_to_string(name_ptr);
+            let parent_path = u16_ptr_to_string(path_ptr);
+
+            let mut size = 0u64;
+            if !is_dir {
+                (lib.get_result_size)(i, &mut size);
+            }
+
+            let parent_path_norm = normalize_windows_str_path(&parent_path);
+            let full_path = join_windows_path(&parent_path_norm, &name);
+
+            acc.push_node(FlatNode {
+                parent_path: parent_path_norm,
+                name,
+                full_path,
+                is_dir,
+                size,
+            });
+
+            if acc.should_flush() {
+                flush_partial_tree(&mut acc, tx)?;
+            }
+        }
+
+        flush_partial_tree(&mut acc, tx)?;
+        (lib.reset)();
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn build_tree_from_everything_dll(
+    _search_str: &str,
+    _tx: &Sender<Result<FileNode, String>>,
+) -> Result<(), String> {
+    Err("Everything API 仅支持 Windows 系统".to_string())
 }

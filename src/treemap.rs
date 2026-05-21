@@ -63,6 +63,128 @@ pub fn generate_color(name: &str, is_dir: bool) -> Color {
     Color::from_rgb(r + m, g + m, b + m)
 }
 
+fn fit_char_count(max_width: f32, font_size: f32) -> usize {
+    ((max_width / (font_size * 0.58)).floor() as usize).max(1)
+}
+
+fn ellipsize(text: &str, max_chars: usize) -> String {
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+
+    if max_chars <= 1 {
+        return "…".to_string();
+    }
+
+    let mut result = text.chars().take(max_chars - 1).collect::<String>();
+    result.push('…');
+    result
+}
+
+fn build_header_label(name: &str, size: u64, max_width: f32, font_size: f32) -> String {
+    let full = format!("{} ({})", name, format_size(size));
+    ellipsize(&full, fit_char_count(max_width, font_size))
+}
+
+fn build_leaf_label(name: &str, size: u64, max_width: f32, font_size: f32) -> String {
+    let max_chars = fit_char_count(max_width, font_size);
+    let name_line = ellipsize(name, max_chars);
+    let size_line = ellipsize(&format_size(size), max_chars);
+    format!("{name_line}\n{size_line}")
+}
+
+fn draw_overlay_panel(frame: &mut Frame, rect: Rectangle) {
+    frame.fill_rectangle(
+        Point::new(rect.x + 3.0, rect.y + 4.0),
+        rect.size(),
+        Color::from_rgba(0.0, 0.0, 0.0, 0.28),
+    );
+
+    frame.fill_rectangle(
+        rect.position(),
+        rect.size(),
+        Color::from_rgba(0.06, 0.07, 0.09, 1.0),
+    );
+
+    let top = Rectangle::new(rect.position(), Size::new(rect.width, 1.0));
+    let left = Rectangle::new(rect.position(), Size::new(1.0, rect.height));
+    let right = Rectangle::new(
+        Point::new(rect.x + rect.width - 1.0, rect.y),
+        Size::new(1.0, rect.height),
+    );
+    let bottom = Rectangle::new(
+        Point::new(rect.x, rect.y + rect.height - 1.0),
+        Size::new(rect.width, 1.0),
+    );
+
+    for border in [top, left, right, bottom] {
+        frame.fill_rectangle(
+            border.position(),
+            border.size(),
+            Color::from_rgba(0.92, 0.95, 1.0, 1.0),
+        );
+    }
+}
+
+fn rectangles_intersect(a: Rectangle, b: Rectangle) -> bool {
+    a.x < b.x + b.width
+        && a.x + a.width > b.x
+        && a.y < b.y + b.height
+        && a.y + a.height > b.y
+}
+
+fn compute_tooltip_rect(
+    block: &LayoutBlock,
+    bounds: Rectangle,
+    cursor_pos: Point,
+) -> Rectangle {
+    let path_chars: Vec<char> = block.path.chars().collect();
+    let wrapped_path = path_chars
+        .chunks(45)
+        .map(|c| c.iter().collect::<String>())
+        .collect::<Vec<_>>()
+        .join("\n  ");
+
+    let tooltip_text = format!(
+        "名称: {}\n路径: {}\n大小: {}",
+        block.name,
+        wrapped_path,
+        format_size(block.size)
+    );
+    let line_count = tooltip_text.lines().count() as f32;
+    let line_height = 18.0;
+    let padding = 12.0;
+
+    let tooltip_w = 340.0_f32;
+    let tooltip_h = padding * 2.0 + line_count * line_height;
+
+    let mut tooltip_x = cursor_pos.x + 15.0;
+    let mut tooltip_y = cursor_pos.y + 15.0;
+
+    if tooltip_x + tooltip_w > bounds.width {
+        tooltip_x = cursor_pos.x - tooltip_w - 15.0;
+    }
+    if tooltip_y + tooltip_h > bounds.height {
+        tooltip_y = cursor_pos.y - tooltip_h - 15.0;
+    }
+    tooltip_x = tooltip_x.max(5.0);
+    tooltip_y = tooltip_y.max(5.0);
+
+    Rectangle::new(
+        Point::new(tooltip_x, tooltip_y),
+        Size::new(tooltip_w, tooltip_h),
+    )
+}
+
+fn label_color(blocked_by_overlay: bool, default: Color) -> Color {
+    if blocked_by_overlay {
+        Color::from_rgba(0.0, 0.0, 0.0, 0.5)
+    } else {
+        default
+    }
+}
+
 pub fn compute_treemap(
     rect: Rectangle,
     root_node: &FileNode,
@@ -277,6 +399,29 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
         let vr = state.visual_rects.borrow();
         let ha = state.hover_alphas.borrow();
 
+        let tooltip_overlay_rect = if let Some(hover_path) = &state.current_hover {
+            if state.context_menu.is_none() {
+                if let Some(cursor_pos) = cursor.position_in(bounds) {
+                    ideal_blocks
+                        .iter()
+                        .find(|b| &b.path == hover_path)
+                        .map(|block| compute_tooltip_rect(block, bounds, cursor_pos))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        let menu_overlay_rect = state.context_menu.as_ref().map(|(menu_pos, _)| {
+            Rectangle::new(*menu_pos, Size::new(160.0, 35.0 * 3.0))
+        });
+
+        let blocking_overlay_rect = menu_overlay_rect.or(tooltip_overlay_rect);
+
         for block in &ideal_blocks {
             let rect = vr.get(&block.path).copied().unwrap_or(block.rect);
             let draw_rect = Rectangle::new(
@@ -293,12 +438,29 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
                 base_frame.fill_rectangle(draw_rect.position(), draw_rect.size(), bg_color);
 
                 if draw_rect.height > 20.0 {
-                    base_frame.fill_text(canvas::Text {
-                        content: format!("{} ({})", block.name, format_size(block.size)),
-                        position: Point::new(draw_rect.x + 6.0, draw_rect.y + 4.0),
-                        color: Color::from_rgba(1.0, 1.0, 1.0, 0.8),
-                        size: 14.0.into(),
-                        ..Default::default()
+                    let header_region = Rectangle::new(
+                        Point::new(draw_rect.x + 2.0, draw_rect.y + 2.0),
+                        Size::new((draw_rect.width - 4.0).max(0.0), 18.0),
+                    );
+                    let is_blocked = blocking_overlay_rect
+                        .is_some_and(|overlay| rectangles_intersect(header_region, overlay));
+
+                    let header_label = build_header_label(
+                        &block.name,
+                        block.size,
+                        header_region.width - 8.0,
+                        14.0,
+                    );
+
+                    base_frame.with_clip(header_region, |frame| {
+                        frame.fill_text(canvas::Text {
+                            content: header_label,
+                            position: Point::new(header_region.x + 4.0, header_region.y + 1.0),
+                            max_width: (header_region.width - 8.0).max(1.0),
+                            color: label_color(is_blocked, Color::from_rgba(1.0, 1.0, 1.0, 0.8)),
+                            size: 14.0.into(),
+                            ..Default::default()
+                        });
                     });
                 }
             } else {
@@ -314,13 +476,29 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
                 }
 
                 if draw_rect.width > 60.0 && draw_rect.height > 30.0 {
-                    let label = format!("{}\n{}", block.name, format_size(block.size));
-                    base_frame.fill_text(canvas::Text {
-                        content: label,
-                        position: Point::new(draw_rect.x + 5.0, draw_rect.y + 5.0),
-                        color: Color::WHITE,
-                        size: 14.0.into(),
-                        ..Default::default()
+                    let text_region = Rectangle::new(
+                        Point::new(draw_rect.x + 3.0, draw_rect.y + 3.0),
+                        Size::new((draw_rect.width - 6.0).max(0.0), (draw_rect.height - 6.0).max(0.0)),
+                    );
+                    let is_blocked = blocking_overlay_rect
+                        .is_some_and(|overlay| rectangles_intersect(text_region, overlay));
+
+                    let label = build_leaf_label(
+                        &block.name,
+                        block.size,
+                        text_region.width - 4.0,
+                        14.0,
+                    );
+
+                    base_frame.with_clip(text_region, |frame| {
+                        frame.fill_text(canvas::Text {
+                            content: label,
+                            position: Point::new(text_region.x + 2.0, text_region.y + 2.0),
+                            max_width: (text_region.width - 4.0).max(1.0),
+                            color: label_color(is_blocked, Color::WHITE),
+                            size: 14.0.into(),
+                            ..Default::default()
+                        });
                     });
                 }
             }
@@ -343,39 +521,18 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
                         wrapped_path,
                         format_size(block.size)
                     );
-                    let line_count = tooltip_text.lines().count() as f32;
-                    let line_height = 18.0;
                     let padding = 12.0;
+                    let tooltip_rect = compute_tooltip_rect(block, bounds, cursor_pos);
 
-                    let tooltip_w = 340.0_f32;
-                    let tooltip_h = padding * 2.0 + line_count * line_height;
-
-                    let mut tooltip_x = cursor_pos.x + 15.0;
-                    let mut tooltip_y = cursor_pos.y + 15.0;
-
-                    if tooltip_x + tooltip_w > bounds.width {
-                        tooltip_x = cursor_pos.x - tooltip_w - 15.0;
-                    }
-                    if tooltip_y + tooltip_h > bounds.height {
-                        tooltip_y = cursor_pos.y - tooltip_h - 15.0;
-                    }
-                    tooltip_x = tooltip_x.max(5.0);
-                    tooltip_y = tooltip_y.max(5.0);
-
-                    let tooltip_rect = Rectangle::new(
-                        Point::new(tooltip_x, tooltip_y),
-                        Size::new(tooltip_w, tooltip_h),
-                    );
-
-                    overlay_frame.fill_rectangle(
-                        tooltip_rect.position(),
-                        tooltip_rect.size(),
-                        Color::from_rgba(0.08, 0.08, 0.08, 0.95),
-                    );
+                    draw_overlay_panel(&mut overlay_frame, tooltip_rect);
 
                     overlay_frame.fill_text(canvas::Text {
                         content: tooltip_text,
-                        position: Point::new(tooltip_x + padding, tooltip_y + padding - 2.0),
+                        position: Point::new(
+                            tooltip_rect.x + padding,
+                            tooltip_rect.y + padding - 2.0,
+                        ),
+                        max_width: (tooltip_rect.width - padding * 2.0).max(1.0),
                         color: Color::WHITE,
                         size: 13.0.into(),
                         ..Default::default()
@@ -391,11 +548,7 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
 
             let menu_rect = Rectangle::new(*menu_pos, Size::new(menu_w, menu_h));
 
-            overlay_frame.fill_rectangle(
-                menu_rect.position(),
-                menu_rect.size(),
-                Color::from_rgba(0.15, 0.15, 0.15, 0.98),
-            );
+            draw_overlay_panel(&mut overlay_frame, menu_rect);
 
             let items = ["在资源管理器中显示", "重命名", "移至回收站"];
             for (i, label) in items.iter().enumerate() {

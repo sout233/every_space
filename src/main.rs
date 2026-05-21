@@ -69,6 +69,7 @@ enum AppState {
         source_path: String,
         root_node: FileNode,
         current_path: String,
+        path_history: Vec<String>,
         expanded_paths: FxHashSet<String>,
         rx: Receiver<Result<FileNode, String>>,
         anim_tick: usize,
@@ -123,6 +124,7 @@ impl SpaceSnifferApp {
             source_path: path,
             root_node: FileNode::root(),
             current_path: "".to_string(),
+            path_history: Vec::new(),
             expanded_paths: FxHashSet::default(),
             rx,
             anim_tick: 0,
@@ -226,6 +228,8 @@ impl SpaceSnifferApp {
                         source_kind,
                         source_path,
                         root_node,
+                        current_path,
+                        path_history,
                         expanded_paths,
                         ..
                     } = temp_state
@@ -234,8 +238,8 @@ impl SpaceSnifferApp {
                             source_kind,
                             source_path,
                             root_node,
-                            current_path: "".to_string(),
-                            path_history: Vec::new(),
+                            current_path,
+                            path_history,
                             expanded_paths,
                             anim_tick: 0,
                             rename_target: None,
@@ -245,42 +249,60 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::ToggleExpand(path) => {
-                if let AppState::Loaded { expanded_paths, .. } = &mut self.state {
-                    if expanded_paths.contains(&path) {
-                        expanded_paths.remove(&path);
-                    } else {
-                        expanded_paths.insert(path);
+                match &mut self.state {
+                    AppState::Loading { expanded_paths, .. } | AppState::Loaded { expanded_paths, .. } => {
+                        if expanded_paths.contains(&path) {
+                            expanded_paths.remove(&path);
+                        } else {
+                            expanded_paths.insert(path);
+                        }
                     }
+                    _ => {}
                 }
                 Task::none()
             }
             Message::Navigate(path) => {
-                if let AppState::Loaded {
-                    root_node,
-                    current_path,
-                    path_history,
-                    ..
-                } = &mut self.state
-                {
-                    if let Some(node) = Self::find_node(root_node, &path) {
-                        if node.is_dir {
-                            path_history.push(current_path.clone());
-                            *current_path = path;
+                match &mut self.state {
+                    AppState::Loading {
+                        root_node,
+                        current_path,
+                        path_history,
+                        ..
+                    }
+                    | AppState::Loaded {
+                        root_node,
+                        current_path,
+                        path_history,
+                        ..
+                    } => {
+                        if let Some(node) = Self::find_node(root_node, &path) {
+                            if node.is_dir {
+                                path_history.push(current_path.clone());
+                                *current_path = path;
+                            }
                         }
                     }
+                    _ => {}
                 }
                 Task::none()
             }
             Message::GoBack => {
-                if let AppState::Loaded {
-                    current_path,
-                    path_history,
-                    ..
-                } = &mut self.state
-                {
-                    if let Some(prev) = path_history.pop() {
-                        *current_path = prev;
+                match &mut self.state {
+                    AppState::Loading {
+                        current_path,
+                        path_history,
+                        ..
                     }
+                    | AppState::Loaded {
+                        current_path,
+                        path_history,
+                        ..
+                    } => {
+                        if let Some(prev) = path_history.pop() {
+                            *current_path = prev;
+                        }
+                    }
+                    _ => {}
                 }
                 Task::none()
             }
@@ -404,7 +426,7 @@ impl SpaceSnifferApp {
                     // 卡片 2
                     button(
                         column![
-                            text("读取 Everything CSV 报告")
+                            text("读取 Everything CSV 文件")
                                 .size(20),
                             text("离线分析")
                                 .size(13),
@@ -461,23 +483,49 @@ impl SpaceSnifferApp {
                 source_path,
                 root_node,
                 current_path,
+                path_history,
                 expanded_paths,
                 ..
             } => {
                 let current_node = Self::find_node(root_node, current_path).unwrap_or(root_node);
 
-                let top_bar = row![
+                let mut top_bar = row![
                     Circular::new().size(20.0).easing(&easing::STANDARD),
-                    text(format!(
-                        "少女祈祷中... 来源: {} | 已分析大小: {} | {}",
-                        source_kind.label(),
-                        treemap::format_size(root_node.size),
-                        source_path
-                    ))
-                    .size(18)
                 ]
-                .spacing(15)
+                .spacing(12)
                 .align_y(iced::Alignment::Center);
+
+                if !path_history.is_empty() {
+                    top_bar = top_bar.push(
+                        button("返回上级")
+                            .style(button_style)
+                            .padding(Padding {
+                                top: 6.0,
+                                right: 12.0,
+                                bottom: 6.0,
+                                left: 12.0,
+                            })
+                            .on_press(Message::GoBack)
+                    );
+                }
+
+                let display_path = if current_path.is_empty() {
+                    "计算机 (根目录)"
+                } else {
+                    current_path
+                };
+
+                top_bar = top_bar.push(
+                    text(format!(
+                        "实时扫描中... 当前位置: {} (已阅: {}) | 来源: {} ({}) | 已分析总量: {}",
+                        display_path,
+                        treemap::format_size(current_node.size),
+                        source_kind.label(),
+                        source_path,
+                        treemap::format_size(root_node.size)
+                    ))
+                    .size(16),
+                );
 
                 let map = TreemapCanvas {
                     root_node: current_node,

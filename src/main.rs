@@ -31,7 +31,19 @@ fn get_tokio_runtime() -> &'static Runtime {
     })
 }
 
+fn init_logger() {
+    use std::io::Write;
+    env_logger::Builder::new()
+        .format(|buf, record| {
+            writeln!(buf, "{}", record.args())
+        })
+        .filter(None, log::LevelFilter::Info)
+        .init();
+}
+
 pub fn main() -> iced::Result {
+    init_logger();
+    log::info!("[app] app started");
     iced::application(
         SpaceSnifferApp::default,
         SpaceSnifferApp::update,
@@ -82,7 +94,7 @@ enum AppState {
         path_history: Vec<String>,
         expanded_paths: FxHashSet<String>,
         anim_tick: usize,
-        rename_target: Option<(String, String)>, // (原路径, 新名字输入)
+        rename_target: Option<(String, String)>, // (old path, new name input)
     },
     Error(String),
 }
@@ -156,30 +168,42 @@ impl SpaceSnifferApp {
     fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::LoadEverything => {
+                log::info!("[app] loading everything dll source");
                 let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
                 self.start_loading(DataSourceKind::EverythingDll, system_drive)
             }
             Message::LoadMft => {
+                log::info!("[app] loading mft source");
                 match Self::resolve_system_mft_path() {
                     Ok(path) => self.start_loading(DataSourceKind::Mft, path),
                     Err(err) => {
+                        log::error!("[app] resolve mft path err: {}", err);
                         self.state = AppState::Error(err);
                         Task::none()
                     }
                 }
             }
-            Message::PickCsvFile => Task::perform(
-                async {
-                    rfd::AsyncFileDialog::new()
-                        .add_filter("CSV Data", &["csv"])
-                        .pick_file()
-                        .await
-                        .map(|f| f.path().to_string_lossy().to_string())
-                },
-                |path| Message::FilePicked(DataSourceKind::Csv, path),
-            ),
-            Message::FilePicked(source_kind, Some(path)) => self.start_loading(source_kind, path),
-            Message::FilePicked(_, None) => Task::none(),
+            Message::PickCsvFile => {
+                log::info!("[app] opening csv picker");
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .add_filter("CSV Data", &["csv"])
+                            .pick_file()
+                            .await
+                            .map(|f| f.path().to_string_lossy().to_string())
+                    },
+                    |path| Message::FilePicked(DataSourceKind::Csv, path),
+                )
+            }
+            Message::FilePicked(source_kind, Some(path)) => {
+                log::info!("[app] selected source {:?} at {}", source_kind, path);
+                self.start_loading(source_kind, path)
+            }
+            Message::FilePicked(_, None) => {
+                log::info!("[app] csv selection canceled");
+                Task::none()
+            }
             Message::Tick(_now) => {
                 let mut is_finished_loading = false;
                 let mut error_msg = None;
@@ -216,11 +240,13 @@ impl SpaceSnifferApp {
                 }
 
                 if let Some(err) = error_msg {
+                    log::error!("[app] err occurred during load: {}", err);
                     self.state = AppState::Error(err);
                     return Task::none();
                 }
 
                 if is_finished_loading {
+                    log::info!("[app] 就此结束了吗……");
                     let mut temp_state = AppState::Idle;
                     std::mem::swap(&mut self.state, &mut temp_state);
 
@@ -249,6 +275,7 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::ToggleExpand(path) => {
+                log::info!("[app] toggle expand {}", path);
                 match &mut self.state {
                     AppState::Loading { expanded_paths, .. } | AppState::Loaded { expanded_paths, .. } => {
                         if expanded_paths.contains(&path) {
@@ -262,6 +289,7 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::Navigate(path) => {
+                log::info!("[app] navigate to {}", path);
                 match &mut self.state {
                     AppState::Loading {
                         root_node,
@@ -287,6 +315,7 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::GoBack => {
+                log::info!("[app] go back");
                 match &mut self.state {
                     AppState::Loading {
                         current_path,
@@ -307,6 +336,7 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::OpenInExplorer(path) => {
+                log::info!("[app] open explorer select {}", path);
                 let _ = std::process::Command::new("explorer")
                     .arg("/select,")
                     .arg(&path)
@@ -314,6 +344,7 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::RequestDelete(path) => {
+                log::info!("[app] request delete {}", path);
                 let path_clone = path.clone();
                 Task::perform(
                     async move {
@@ -325,15 +356,17 @@ impl SpaceSnifferApp {
             }
             Message::FileDeleted(path, success) => {
                 if success {
+                    log::info!("[app] delete success {}", path);
                     if let AppState::Loaded { root_node, .. } = &mut self.state {
                         root_node.remove_by_path(&path);
                     }
                 } else {
-                    println!("放入回收站失败");
+                    log::error!("[app] delete failed {}", path);
                 }
                 Task::none()
             }
             Message::RequestRename(path) => {
+                log::info!("[app] request rename old {}", path);
                 if let AppState::Loaded { rename_target, .. } = &mut self.state {
                     let old_name = Path::new(&path)
                         .file_name()
@@ -367,9 +400,10 @@ impl SpaceSnifferApp {
                             let new_path = parent.join(&new_name);
 
                             if std::fs::rename(p, &new_path).is_ok() {
+                                log::info!("[app] file rename finished");
                                 root_node.rename_by_path(&target_path, &new_name);
                             } else {
-                                println!("rename failed，pls check file 有没有被占用");
+                                log::error!("[app] rename failed");
                             }
                         }
                     }
@@ -377,12 +411,14 @@ impl SpaceSnifferApp {
                 Task::none()
             }
             Message::CancelRename => {
+                log::info!("[app] rename canceled");
                 if let AppState::Loaded { rename_target, .. } = &mut self.state {
                     *rename_target = None;
                 }
                 Task::none()
             }
             Message::BackToIdle => {
+                log::info!("[app] back to main menu");
                 self.state = AppState::Idle;
                 Task::none()
             }
@@ -403,7 +439,6 @@ impl SpaceSnifferApp {
                 .align_x(iced::Alignment::Center);
 
                 let cards = row![
-                    // 卡片 1
                     button(
                         column![
                             text("直接调用 Everything")
@@ -423,7 +458,6 @@ impl SpaceSnifferApp {
                     .on_press(Message::LoadEverything)
                     .width(235),
 
-                    // 卡片 2
                     button(
                         column![
                             text("读取 Everything CSV 文件")
@@ -443,7 +477,6 @@ impl SpaceSnifferApp {
                     .on_press(Message::PickCsvFile)
                     .width(275),
 
-                    // 卡片 3
                     button(
                         column![
                             text("直接读取 NTFS MFT")

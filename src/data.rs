@@ -219,6 +219,8 @@ pub fn build_tree_stream(
     file_path: String,
     tx: Sender<Result<FileNode, String>>,
 ) {
+    log::info!("[app] 世界树正在天上失禁地看着你……");
+
     std::thread::spawn(move || {
         let result = match source_kind {
             DataSourceKind::EverythingDll => build_tree_from_everything_dll(&file_path, &tx),
@@ -233,6 +235,7 @@ pub fn build_tree_stream(
 }
 
 fn build_tree_from_csv(file_path: &str, tx: &Sender<Result<FileNode, String>>) -> Result<(), String> {
+    log::info!("[csv] reading csv file");
     let file = File::open(file_path).map_err(|e| format!("打开 CSV 失败: {e}"))?;
     let mut rdr = csv::ReaderBuilder::new()
         .has_headers(true)
@@ -260,6 +263,7 @@ fn build_tree_from_csv(file_path: &str, tx: &Sender<Result<FileNode, String>>) -
     }
 
     flush_partial_tree(&mut acc, tx)?;
+    log::info!("[csv] csv deserialized successfully");
     Ok(())
 }
 
@@ -366,6 +370,7 @@ fn open_mft_file(file_path: &str) -> Result<File, String> {
     }
 
     unsafe fn enable_backup_privilege() -> Result<(), String> {
+        log::info!("[mft] enabling backup privilege");
         let mut token: HANDLE = std::ptr::null_mut();
         if unsafe {
             OpenProcessToken(
@@ -420,6 +425,7 @@ fn open_mft_file(file_path: &str) -> Result<File, String> {
             return Err(format!("启用 SeBackupPrivilege 失败，os err {}", err));
         }
 
+        log::info!("[mft] backup privilege enabled");
         Ok(())
     }
 
@@ -597,6 +603,7 @@ fn build_tree_from_volume_mft(
     let volume_path = extract_drive_root(file_path)?;
     let wide_volume_path = to_utf16(&volume_path);
 
+    log::info!("[mft] opening volume {}", volume_path);
     let handle = unsafe {
         CreateFileW(
             wide_volume_path.as_ptr(),
@@ -618,9 +625,12 @@ fn build_tree_from_volume_mft(
         return Err(msg);
     }
 
+    log::info!("[mft] volume opened successfully");
+
     let run = (|| -> Result<(), String> {
         let (record_size_raw, total_records) = unsafe { get_volume_data_info(handle)? };
         let record_size = record_size_raw as usize;
+        log::info!("[mft] reading volume data: rec_sz={}, total_rec={}", record_size, total_records);
         let mut cache: rustc_hash::FxHashMap<u64, TempMftEntry> = rustc_hash::FxHashMap::default();
 
         let mut probe = (total_records as i64) - 1;
@@ -637,7 +647,7 @@ fn build_tree_from_volume_mft(
                     };
 
                     if entry.header.is_valid() && entry.is_allocated() {
-                        // 仅保留主记录，过滤掉 Extension Records (非主记录)
+                        // keep primary records only, skip extension records
                         if entry.header.base_reference.entry != 0 {
                             probe = (actual_record as i64) - 1;
                             continue;
@@ -650,7 +660,7 @@ fn build_tree_from_volume_mft(
                             let name = attr.name.clone();
                             let parent_id = attr.parent.entry;
 
-                            // 从 $DATA (0x80) 属性中获取文件的真实/最新大小，防止大小缩水
+                            // get actual file size from $DATA (0x80) attribute to prevent shrinking
                             let mut size = 0u64;
                             if !is_dir {
                                 let mut found_data = false;
@@ -696,6 +706,7 @@ fn build_tree_from_volume_mft(
                     break;
                 }
                 Err(_) => {
+                    log::info!("[mft] binary search triggered");
                     let mut low = 0;
                     let mut high = probe - 1;
                     let mut found_valid = None;
@@ -773,6 +784,7 @@ fn build_tree_from_volume_mft(
             node
         }
 
+        log::info!("[mft] dfs traversal starts");
         let mut computer_root = FileNode::root();
         if cache.contains_key(&5) {
             let mut visited = rustc_hash::FxHashSet::default();
@@ -808,7 +820,7 @@ fn build_tree_from_volume_mft(
                 root_c.children.insert(lost_dir_name, lost_dir_node);
             }
 
-            // 更新 C 盘节点名称与路径
+            // update C drive node name and path
             root_c.name = drive_prefix.clone();
             root_c.full_path = drive_prefix.clone();
 
@@ -816,6 +828,7 @@ fn build_tree_from_volume_mft(
             computer_root.children.insert(drive_prefix, root_c);
         }
 
+        log::info!("[mft] dfs tree built successfully");
         tx.send(Ok(computer_root)).map_err(|_| "加载已取消".to_string())?;
         Ok(())
     })();
@@ -907,7 +920,8 @@ const EVERYTHING64_DLL_BYTES: &[u8] = include_bytes!("../sdk/dll/Everything64.dl
 #[cfg(windows)]
 impl EverythingLib {
     fn extract_embedded_dll() -> Result<std::path::PathBuf, String> {
-        // 1. 优先尝试释放到程序 exe 同级目录
+        log::info!("[dll] extracting embedded dll");
+        // 1. try extracting to same folder as exe
         let exe_dir = std::env::current_exe()
             .ok()
             .and_then(|p| p.parent().map(|d| d.to_path_buf()));
@@ -923,7 +937,7 @@ impl EverythingLib {
             }
         }
 
-        // 2. 如果 exe 目录获取/写入失败， fallback 写入当前工作目录
+        // 2. fallback to current working directory
         let mut work_path = std::env::current_dir()
             .map_err(|e| format!("获取当前工作目录失败: {}", e))?;
         work_path.push("Everything64.dll");
@@ -940,6 +954,7 @@ impl EverythingLib {
         use std::os::windows::ffi::OsStrExt;
         use windows_sys::Win32::System::LibraryLoader::{LoadLibraryW, GetProcAddress};
 
+        log::info!("[dll] trying to load dll");
         let paths = [
             std::path::Path::new("Everything64.dll").to_path_buf(),
             std::path::Path::new("sdk/dll/Everything64.dll").to_path_buf(),
@@ -966,7 +981,7 @@ impl EverythingLib {
             }
         }
 
-        // 自行释放并读取！
+        // extract and load dll if not found
         if hmodule.is_null() {
             if let Ok(extracted_path) = Self::extract_embedded_dll() {
                 let wide: Vec<u16> = OsStr::new(&extracted_path).encode_wide().chain(std::iter::once(0)).collect();
@@ -980,6 +995,8 @@ impl EverythingLib {
         if hmodule.is_null() {
             return Err("未找到 Everything64.dll 且释放嵌入 DLL 失败。请确保程序对运行目录或工作目录具有写入权限。".to_string());
         }
+
+        log::info!("[dll] dll loaded successfully");
 
         unsafe {
             let get_fn = |name: &str| -> Result<*const std::ffi::c_void, String> {
@@ -1051,8 +1068,9 @@ fn build_tree_from_everything_dll(
         .collect();
 
     unsafe {
+        log::info!("[everything] querying items");
         (lib.set_search)(search_wide.as_ptr());
-        // 请求：名称 (0x1) | 路径 (0x2) | 大小 (0x10)
+        // request name, path, and size
         (lib.set_request_flags)(0x00000001 | 0x00000002 | 0x00000010);
 
         let ok = (lib.query)(1);
@@ -1066,6 +1084,7 @@ fn build_tree_from_everything_dll(
         }
 
         let num_results = (lib.get_num_results)();
+        log::info!("[everything] query success, found {} items", num_results);
         let mut acc = TreeAccumulator::new();
 
         for i in 0..num_results {

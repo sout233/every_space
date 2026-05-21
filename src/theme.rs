@@ -6,7 +6,7 @@ pub fn button_style(_theme: &iced::Theme, status: button::Status) -> button::Sty
         background: Some(Background::Color(Color::WHITE)),
         text_color: Color::BLACK,
         border: Border {
-            radius: 64.0.into(),
+            radius: 12.0.into(),
             width: 0.0,
             color: Color::TRANSPARENT,
         },
@@ -117,4 +117,3 @@ pub fn secondary_button_style(_theme: &iced::Theme, status: button::Status) -> b
         _ => base,
     }
 }
-

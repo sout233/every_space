@@ -5,7 +5,7 @@ mod treemap;
 mod theme;
 
 use iced::time::Instant;
-use iced::widget::{Canvas, button, column, container, row, text, text_input};
+use iced::widget::{Canvas, Space, button, column, container, row, text, text_input};
 use iced::{Element, Fill, Padding, Task, window};
 use rustc_hash::FxHashSet;
 use std::env;
@@ -72,6 +72,8 @@ pub enum Message {
     ConfirmRename,
     CancelRename,
     BackToIdle,
+    ViewportChanged { zoom: f32, pan_x: f32, pan_y: f32 },
+    ResetViewport,
 }
 
 enum AppState {
@@ -95,6 +97,9 @@ enum AppState {
         expanded_paths: FxHashSet<String>,
         anim_tick: usize,
         rename_target: Option<(String, String)>, // (old path, new name input)
+        zoom: f32,
+        pan_x: f32,
+        pan_y: f32,
     },
     Error(String),
 }
@@ -269,6 +274,9 @@ impl SpaceSnifferApp {
                             expanded_paths,
                             anim_tick: 0,
                             rename_target: None,
+                            zoom: 1.0,
+                            pan_x: 0.0,
+                            pan_y: 0.0,
                         };
                     }
                 }
@@ -422,6 +430,34 @@ impl SpaceSnifferApp {
                 self.state = AppState::Idle;
                 Task::none()
             }
+            Message::ViewportChanged { zoom, pan_x, pan_y } => {
+                if let AppState::Loaded {
+                    zoom: ref_zoom,
+                    pan_x: ref_pan_x,
+                    pan_y: ref_pan_y,
+                    ..
+                } = &mut self.state
+                {
+                    *ref_zoom = zoom;
+                    *ref_pan_x = pan_x;
+                    *ref_pan_y = pan_y;
+                }
+                Task::none()
+            }
+            Message::ResetViewport => {
+                if let AppState::Loaded {
+                    zoom,
+                    pan_x,
+                    pan_y,
+                    ..
+                } = &mut self.state
+                {
+                    *zoom = 1.0;
+                    *pan_x = 0.0;
+                    *pan_y = 0.0;
+                }
+                Task::none()
+            }
         }
     }
 
@@ -563,6 +599,9 @@ impl SpaceSnifferApp {
                 let map = TreemapCanvas {
                     root_node: current_node,
                     expanded_paths,
+                    zoom: 1.0,
+                    pan_x: 0.0,
+                    pan_y: 0.0,
                 };
 
                 container(column![
@@ -609,11 +648,14 @@ impl SpaceSnifferApp {
                 path_history,
                 expanded_paths,
                 rename_target,
+                zoom,
+                pan_x,
+                pan_y,
                 ..
             } => {
                 let current_node = Self::find_node(root_node, current_path).unwrap_or(root_node);
 
-                let mut top_bar = row![].spacing(12).align_y(iced::Alignment::Center);
+                let mut top_bar = row![].spacing(12).align_y(iced::Alignment::Center).width(Fill);
                 if !path_history.is_empty() {
                     top_bar = top_bar.push(
                         button("返回上级")
@@ -627,18 +669,6 @@ impl SpaceSnifferApp {
                             .on_press(Message::GoBack)
                     );
                 }
-
-                top_bar = top_bar.push(
-                    button("重新选择数据源")
-                        .style(button_style)
-                        .padding(Padding {
-                            top: 6.0,
-                            right: 12.0,
-                            bottom: 6.0,
-                            left: 12.0,
-                        })
-                        .on_press(Message::BackToIdle)
-                );
 
                 let display_path = if current_path.is_empty() {
                     "计算机 (根目录)"
@@ -689,9 +719,40 @@ impl SpaceSnifferApp {
                         );
                 }
 
+                top_bar = top_bar.push(Space::new().width(Fill));
+
+                if *zoom != 1.0 || *pan_x != 0.0 || *pan_y != 0.0 {
+                    top_bar = top_bar.push(
+                        button("重置视图")
+                            .style(secondary_button_style)
+                            .padding(Padding {
+                                top: 6.0,
+                                right: 12.0,
+                                bottom: 6.0,
+                                left: 12.0,
+                            })
+                            .on_press(Message::ResetViewport)
+                    );
+                }
+
+                top_bar = top_bar.push(
+                    button("重新选择数据源")
+                        .style(button_style)
+                        .padding(Padding {
+                            top: 6.0,
+                            right: 12.0,
+                            bottom: 6.0,
+                            left: 12.0,
+                        })
+                        .on_press(Message::BackToIdle)
+                );
+
                 let map = TreemapCanvas {
                     root_node: current_node,
                     expanded_paths,
+                    zoom: *zoom,
+                    pan_x: *pan_x,
+                    pan_y: *pan_y,
                 };
 
                 container(column![

@@ -315,18 +315,48 @@ fn get_parent_path(path: &str) -> &str {
     path.rfind('\\').map(|idx| &path[..idx]).unwrap_or("")
 }
 
-#[derive(Default)]
 pub struct CanvasState {
     visual_rects: RefCell<FxHashMap<String, Rectangle>>,
     hover_alphas: RefCell<FxHashMap<String, f32>>,
     current_hover: Option<String>,
     last_click: Option<(String, Instant)>,
     pub context_menu: Option<(Point, String)>,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
+    pub is_panning: bool,
+    pub pan_start_mouse: Point,
+    pub pan_start_offset: (f32, f32),
+    pub ctrl_pressed: bool,
+    pub last_middle_click: Option<Instant>,
+}
+
+impl Default for CanvasState {
+    fn default() -> Self {
+        Self {
+            visual_rects: RefCell::default(),
+            hover_alphas: RefCell::default(),
+            current_hover: None,
+            last_click: None,
+            context_menu: None,
+            zoom: 1.0,
+            pan_x: 0.0,
+            pan_y: 0.0,
+            is_panning: false,
+            pan_start_mouse: Point::ORIGIN,
+            pan_start_offset: (0.0, 0.0),
+            ctrl_pressed: false,
+            last_middle_click: None,
+        }
+    }
 }
 
 pub struct TreemapCanvas<'a> {
     pub root_node: &'a FileNode,
     pub expanded_paths: &'a FxHashSet<String>,
+    pub zoom: f32,
+    pub pan_x: f32,
+    pub pan_y: f32,
 }
 
 impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
@@ -424,9 +454,13 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
 
         for block in &ideal_blocks {
             let rect = vr.get(&block.path).copied().unwrap_or(block.rect);
+            let phys_rect = Rectangle::new(
+                Point::new(rect.x * self.zoom + self.pan_x, rect.y * self.zoom + self.pan_y),
+                Size::new(rect.width * self.zoom, rect.height * self.zoom),
+            );
             let draw_rect = Rectangle::new(
-                Point::new(rect.x + 1.0, rect.y + 1.0),
-                Size::new((rect.width - 2.0).max(0.0), (rect.height - 2.0).max(0.0)),
+                Point::new(phys_rect.x + 1.0, phys_rect.y + 1.0),
+                Size::new((phys_rect.width - 2.0).max(0.0), (phys_rect.height - 2.0).max(0.0)),
             );
 
             if block.is_expanded {
@@ -592,14 +626,74 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> Option<iced::widget::Action<Message>> {
+        // Align state with external authority when external is reset
+        if self.zoom == 1.0 && self.pan_x == 0.0 && self.pan_y == 0.0 {
+            if state.zoom != 1.0 || state.pan_x != 0.0 || state.pan_y != 0.0 {
+                state.zoom = 1.0;
+                state.pan_x = 0.0;
+                state.pan_y = 0.0;
+            }
+        }
+
         let local_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
         let ideal_blocks = compute_treemap(local_bounds, self.root_node, self.expanded_paths);
 
+        if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event {
+            state.ctrl_pressed = modifiers.control();
+        }
+
+        if let iced::Event::Mouse(mouse::Event::WheelScrolled { delta }) = event {
+            let scroll_y = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => *y,
+                mouse::ScrollDelta::Pixels { y, .. } => *y / 50.0,
+            };
+            let mouse_pos = cursor
+                .position_in(bounds)
+                .unwrap_or(Point::new(bounds.width / 2.0, bounds.height / 2.0));
+            let factor = 1.15_f32;
+            let old_zoom = state.zoom;
+            let new_zoom = if scroll_y > 0.0 {
+                (old_zoom * factor).min(50.0)
+            } else if scroll_y < 0.0 {
+                (old_zoom / factor).max(0.5)
+            } else {
+                old_zoom
+            };
+
+            if new_zoom != old_zoom {
+                state.pan_x = mouse_pos.x - (mouse_pos.x - state.pan_x) / old_zoom * new_zoom;
+                state.pan_y = mouse_pos.y - (mouse_pos.y - state.pan_y) / old_zoom * new_zoom;
+                state.zoom = new_zoom;
+                return Some(iced::widget::Action::publish(Message::ViewportChanged {
+                    zoom: state.zoom,
+                    pan_x: state.pan_x,
+                    pan_y: state.pan_y,
+                }));
+            }
+            return None;
+        }
+
         if let iced::Event::Mouse(mouse::Event::CursorMoved { .. }) = event {
             if let Some(local_cursor) = cursor.position_in(bounds) {
+                if state.is_panning {
+                    let dx = local_cursor.x - state.pan_start_mouse.x;
+                    let dy = local_cursor.y - state.pan_start_mouse.y;
+                    state.pan_x = state.pan_start_offset.0 + dx;
+                    state.pan_y = state.pan_start_offset.1 + dy;
+                    return Some(iced::widget::Action::publish(Message::ViewportChanged {
+                        zoom: state.zoom,
+                        pan_x: state.pan_x,
+                        pan_y: state.pan_y,
+                    }));
+                }
+
                 state.current_hover = None;
+                let virt_cursor = Point::new(
+                    (local_cursor.x - state.pan_x) / state.zoom,
+                    (local_cursor.y - state.pan_y) / state.zoom,
+                );
                 for block in ideal_blocks.iter().rev() {
-                    if block.rect.contains(local_cursor) {
+                    if block.rect.contains(virt_cursor) {
                         state.current_hover = Some(block.path.clone());
                         break;
                     }
@@ -611,6 +705,39 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
 
         if let iced::Event::Mouse(mouse::Event::ButtonPressed(button)) = event {
             if let Some(local_cursor) = cursor.position_in(bounds) {
+                if button.clone() == mouse::Button::Middle
+                    || (button.clone() == mouse::Button::Left && state.ctrl_pressed)
+                {
+                    let now = Instant::now();
+                    if button.clone() == mouse::Button::Middle {
+                        if let Some(last_time) = state.last_middle_click {
+                            if now.duration_since(last_time).as_millis() < 300 {
+                                state.zoom = 1.0;
+                                state.pan_x = 0.0;
+                                state.pan_y = 0.0;
+                                state.is_panning = false;
+                                state.last_middle_click = None;
+                                return Some(iced::widget::Action::publish(Message::ViewportChanged {
+                                    zoom: 1.0,
+                                    pan_x: 0.0,
+                                    pan_y: 0.0,
+                                }));
+                            }
+                        }
+                        state.last_middle_click = Some(now);
+                    }
+
+                    state.is_panning = true;
+                    state.pan_start_mouse = local_cursor;
+                    state.pan_start_offset = (state.pan_x, state.pan_y);
+                    return None;
+                }
+
+                let virt_cursor = Point::new(
+                    (local_cursor.x - state.pan_x) / state.zoom,
+                    (local_cursor.y - state.pan_y) / state.zoom,
+                );
+
                 if button.clone() == mouse::Button::Left && state.context_menu.is_some() {
                     let (menu_pos, target_path) = state.context_menu.clone().unwrap();
                     let menu_w = 160.0;
@@ -643,7 +770,7 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
                 }
 
                 for block in ideal_blocks.iter().rev() {
-                    if block.rect.contains(local_cursor) {
+                    if block.rect.contains(virt_cursor) {
                         if button.clone() == mouse::Button::Right {
                             let mut menu_x = local_cursor.x;
                             let mut menu_y = local_cursor.y;
@@ -687,6 +814,16 @@ impl<'a> canvas::Program<Message> for TreemapCanvas<'a> {
                 }
             }
         }
+
+        if let iced::Event::Mouse(mouse::Event::ButtonReleased(button)) = event {
+            if button.clone() == mouse::Button::Middle || button.clone() == mouse::Button::Left {
+                if state.is_panning {
+                    state.is_panning = false;
+                    return None;
+                }
+            }
+        }
+
         None
     }
 }

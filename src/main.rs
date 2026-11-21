@@ -61,7 +61,6 @@ pub enum Message {
     SelectAllEverythingDrives,
     ClearEverythingDrives,
     ConfirmEverythingDrives,
-    LoadMft,
     PickCsvFile,
     FilePicked(DataSourceKind, Option<String>),
     Tick(Instant),
@@ -177,10 +176,6 @@ impl SpaceSnifferApp {
         Ok(selected.join("|"))
     }
 
-    fn resolve_system_mft_path() -> Result<String, String> {
-        let system_drive = env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
-        Ok(format!("{system_drive}\\$MFT"))
-    }
 
     fn start_loading(&mut self, source_kind: DataSourceKind, path: String) -> Task<Message> {
         let (tx, rx) = channel::<Result<FileNode, String>>();
@@ -270,17 +265,7 @@ impl SpaceSnifferApp {
                 }
                 Task::none()
             }
-            Message::LoadMft => {
-                log::info!("[app] loading mft source");
-                match Self::resolve_system_mft_path() {
-                    Ok(path) => self.start_loading(DataSourceKind::Mft, path),
-                    Err(err) => {
-                        log::error!("[app] resolve mft path err: {}", err);
-                        self.state = AppState::Error(err);
-                        Task::none()
-                    }
-                }
-            }
+
             Message::PickCsvFile => {
                 log::info!("[app] opening csv picker");
                 Task::perform(
@@ -606,24 +591,7 @@ impl SpaceSnifferApp {
                     .on_press(Message::PickCsvFile)
                     .width(275),
 
-                    button(
-                        column![
-                            text("直接读取 NTFS MFT")
-                                .size(20),
-                            text("我操。NTFS。")
-                                .size(13),
-                            text("不太稳，不太准")
-                                .size(12),
-                            text("（需要右键以管理员权限运行）")
-                                .size(11),
-                        ]
-                        .spacing(8)
-                        .align_x(iced::Alignment::Center)
-                    )
-                    .style(secondary_button_style)
-                    .padding(24)
-                    .on_press(Message::LoadMft)
-                    .width(230),
+
                 ]
                 .spacing(24)
                 .align_y(iced::Alignment::Center);

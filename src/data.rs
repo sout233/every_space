@@ -453,6 +453,120 @@ unsafe fn u16_ptr_to_string(ptr: *const u16) -> String {
 
 
 #[cfg(windows)]
+pub fn is_process_elevated() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    unsafe {
+        let mut token: HANDLE = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return false;
+        }
+        let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+        let mut ret_len = 0u32;
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            (&raw mut elevation).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut ret_len,
+        );
+        CloseHandle(token);
+        ok != 0 && elevation.TokenIsElevated != 0
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_process_elevated() -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn is_everything_running() -> bool {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return false;
+        }
+        let mut entry: PROCESSENTRY32W = std::mem::zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        let mut found = false;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let len = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
+                if name.eq_ignore_ascii_case("Everything.exe") {
+                    found = true;
+                    break;
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+        found
+    }
+}
+
+#[cfg(not(windows))]
+pub fn is_everything_running() -> bool {
+    false
+}
+
+#[cfg(windows)]
+pub fn relaunch_as_admin() -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let exe_path =
+        std::env::current_exe().map_err(|e| format!("获取当前程序路径失败: {}", e))?;
+    let verb: Vec<u16> = std::ffi::OsStr::new("runas")
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let file: Vec<u16> = exe_path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let result = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    if result as usize <= 32 {
+        return Err("未能以管理员身份启动（可能已取消 UAC 授权）。".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn relaunch_as_admin() -> Result<(), String> {
+    Err("仅支持 Windows 系统".to_string())
+}
+
+#[cfg(windows)]
 fn build_tree_from_everything_dll(
     search_str: &str,
     tx: &Sender<Result<FileNode, String>>,
@@ -475,7 +589,22 @@ fn build_tree_from_everything_dll(
         if ok == 0 {
             let err_code = (lib.get_last_error)();
             if err_code == 2 {
-                return Err("无法连接到 Everything 服务。请确保 Everything 客户端已启动且正在后台运行。".to_string());
+                if !is_everything_running() {
+                    return Err(
+                        "无法连接到 Everything 服务。请确保 Everything 客户端已启动且正在后台运行。"
+                            .to_string(),
+                    );
+                }
+                if !is_process_elevated() {
+                    return Err(
+                        "无法连接到 Everything 服务（检测到 Everything 正在运行，可能是其以管理员身份运行导致权限不匹配）。请点击下方“以管理员身份重启”，或取消 Everything 的管理员权限。"
+                            .to_string(),
+                    );
+                }
+                return Err(
+                    "无法连接到 Everything 服务（Everything 正在运行且当前已是管理员权限，请检查 Everything 是否开启 IPC 或是否处于隔离桌面）。"
+                        .to_string(),
+                );
             } else {
                 return Err(format!("Everything 查询失败，错误码: {}", err_code));
             }

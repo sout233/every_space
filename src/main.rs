@@ -75,6 +75,7 @@ pub enum Message {
     ConfirmRename,
     CancelRename,
     BackToIdle,
+    RelaunchAsAdmin,
     ViewportChanged { zoom: f32, pan_x: f32, pan_y: f32 },
     ResetViewport,
 }
@@ -508,6 +509,17 @@ impl SpaceSnifferApp {
                 self.state = AppState::Idle;
                 Task::none()
             }
+            Message::RelaunchAsAdmin => {
+                log::info!("[app] relaunching as administrator");
+                match data::relaunch_as_admin() {
+                    Ok(()) => iced::exit(),
+                    Err(err) => {
+                        log::error!("[app] relaunch as admin failed: {}", err);
+                        self.state = AppState::Error(err);
+                        Task::none()
+                    }
+                }
+            }
             Message::ViewportChanged { zoom, pan_x, pan_y } => {
                 if let AppState::Loaded {
                     zoom: ref_zoom,
@@ -742,13 +754,8 @@ impl SpaceSnifferApp {
                 .into()
             }
 
-            AppState::Error(err) => container(
-                column![
-                    text("出错了")
-                        .size(36),
-                    text(format!("错误信息: {}", err))
-                        .size(16)
-                        .style(text::danger),
+            AppState::Error(err) => {
+                let mut actions = row![
                     button("返回主选择界面")
                         .style(button_style)
                         .padding(Padding {
@@ -759,14 +766,42 @@ impl SpaceSnifferApp {
                         })
                         .on_press(Message::BackToIdle)
                 ]
-                .spacing(24)
-                .align_x(iced::Alignment::Center),
-            )
-            .style(idle_container_style)
-            .width(Fill)
-            .height(Fill)
-            .center(Fill)
-            .into(),
+                .spacing(16);
+
+                if cfg!(windows)
+                    && !data::is_process_elevated()
+                    && err.contains("以管理员身份重启")
+                {
+                    actions = actions.push(
+                        button("以管理员身份重启")
+                            .style(secondary_button_style)
+                            .padding(Padding {
+                                top: 8.0,
+                                right: 12.0,
+                                bottom: 8.0,
+                                left: 12.0,
+                            })
+                            .on_press(Message::RelaunchAsAdmin),
+                    );
+                }
+
+                container(
+                    column![
+                        text("出错了").size(36),
+                        text(format!("错误信息: {}", err))
+                            .size(16)
+                            .style(text::danger),
+                        actions
+                    ]
+                    .spacing(24)
+                    .align_x(iced::Alignment::Center),
+                )
+                .style(idle_container_style)
+                .width(Fill)
+                .height(Fill)
+                .center(Fill)
+                .into()
+            }
 
             AppState::Loaded {
                 source_kind,
